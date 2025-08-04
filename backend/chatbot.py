@@ -826,6 +826,30 @@ class InteractiveRAGChatbot:
                 self.history = self.history[-100:]
             query_lower = query_to_use.lower()
 
+            # Check for missing updates query
+            missing_update_pattern = r"who (?:didn't|did not) update on (\d{4}-\d{2}-\d{2})"
+            missing_match = re.search(missing_update_pattern, query_lower)
+            if missing_match:
+                date_str = missing_match.group(1)
+                missing = self.get_employees_missing_update(date_str)
+                answer = self._format_with_llm(missing, date_str)
+                self.history[-1]['context_types'] = ['updates', 'employees']
+                self.history[-1]['response'] = answer
+                self._set_to_cache(cache_key, answer, ttl=7200)
+                return answer
+
+            # Check for who did update query
+            who_updated_pattern = r"who (?:did|submitted|posted) (?:update|updates?) on (\d{4}-\d{2}-\d{2})"
+            who_updated_match = re.search(who_updated_pattern, query_lower)
+            if who_updated_match:
+                date_str = who_updated_match.group(1)
+                updated_employees = self.get_employees_who_updated(date_str)
+                answer = self._format_who_updated_with_llm(updated_employees, date_str)
+                self.history[-1]['context_types'] = ['updates', 'employees']
+                self.history[-1]['response'] = answer
+                self._set_to_cache(cache_key, answer, ttl=7200)
+                return answer
+
             yearly_pattern = r"(?:yearly|annual|monthly|month) updates? for ([a-zA-Z .'-]+) (?:for|in) (\d{4})"
             match = re.search(yearly_pattern, query_lower)
             if match:
@@ -972,6 +996,84 @@ class InteractiveRAGChatbot:
             print("Successfully cleared Supabase 'conversation_history'.")
         except Exception as e:
             print(f"Error clearing Supabase conversation history: {str(e)}")
+
+    def get_employees_missing_update(self, date_str: str) -> list[str]:
+        """
+        Return a list of employee names who did NOT post a daily update on date_str (YYYY-MM-DD).
+        """
+        resp = (
+            self.supabase
+                .table("daily_updates")
+                .select("employee_id")
+                .eq("date", date_str)
+                .execute()
+        )
+        updated_ids = {row["employee_id"] for row in resp.data}
+
+        emp_resp = (
+            self.supabase
+                .table("employees")
+                .select("employee_id, name")
+                .execute()
+        )
+        return [
+            r["name"]
+            for r in emp_resp.data
+            if r["employee_id"] not in updated_ids
+        ]
+
+    def get_employees_who_updated(self, date_str: str) -> list[str]:
+        """
+        Return a list of employee names who DID post a daily update on date_str (YYYY-MM-DD).
+        """
+        resp = (
+            self.supabase
+                .table("daily_updates")
+                .select("employee_id")
+                .eq("date", date_str)
+                .execute()
+        )
+        updated_ids = {row["employee_id"] for row in resp.data}
+
+        emp_resp = (
+            self.supabase
+                .table("employees")
+                .select("employee_id, name")
+                .execute()
+        )
+        
+        # Create a mapping of employee_id to name for easy lookup
+        emp_id_to_name = {emp["employee_id"]: emp["name"] for emp in emp_resp.data}
+        
+        return [
+            emp_id_to_name[emp_id]
+            for emp_id in updated_ids
+            if emp_id in emp_id_to_name
+        ]
+
+    def _format_with_llm(self, missing: list[str], date_str: str) -> str:
+        if not missing:
+            return f"Great news—all team members submitted their updates on {date_str}!"
+        
+        # Sort the names alphabetically for better readability
+        sorted_names = sorted(missing)
+        
+        # Create a numbered list of all employees
+        numbered_list = "\n".join(f"{i+1}. {name}" for i, name in enumerate(sorted_names))
+        
+        return f"[UPDATES Context] **{len(missing)} employees did NOT submit updates on {date_str}:**\n\n{numbered_list}"
+
+    def _format_who_updated_with_llm(self, updated_employees: list[str], date_str: str) -> str:
+        if not updated_employees:
+            return f"No employees submitted updates on {date_str}."
+        
+        # Sort the names alphabetically for better readability
+        sorted_names = sorted(updated_employees)
+        
+        # Create a numbered list of all employees
+        numbered_list = "\n".join(f"{i+1}. {name}" for i, name in enumerate(sorted_names))
+        
+        return f"[UPDATES Context] **{len(updated_employees)} employees submitted updates on {date_str}:**\n\n{numbered_list}"
 
 @celery_app.task(name='chatbot.nightly_update_task')
 def nightly_update_task():
